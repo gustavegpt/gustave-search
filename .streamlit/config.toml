@@ -1,0 +1,13 @@
+[theme]
+primaryColor = "#C45B3C"
+backgroundColor = "#F4F1EA"
+secondaryBackgroundColor = "#EDE7DA"
+textColor = "#2B2B2B"
+font = "serif"
+
+[server]
+# Keep uploads small; this app takes no file uploads.
+maxUploadSize = 5
+
+[browser]
+gatherUsageStats = false
