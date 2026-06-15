@@ -1,55 +1,39 @@
-# Gustave — public search (friends test build)
+# Gustave — search (test build)
 
-A self-contained Streamlit app that hosts the Gustave restaurant search for a
-handful of testers. It reuses the real search pipeline (`search_v2.py`) over a
-snapshot of the search index (`cache/`), behind a passcode and a spend cap.
+A self-contained Streamlit app hosting the Gustave London restaurant search for
+testers, behind a passcode and a spend cap. It reuses the real search pipeline
+over a bundled snapshot of the search index.
 
-**Nothing secret is in this folder.** The Anthropic API key and passcode are
-set later in the Streamlit dashboard, never committed.
+**No secrets live in this repo.** The Anthropic API key and passcode are set in
+the Streamlit Cloud dashboard, never committed.
 
 ```
-deploy/
-├── app.py                 # the friend-facing search UI (passcode + spend cap)
-├── search_v2.py           # search engine (copied from ../gustave)
-├── cache/                 # search index snapshot (5 faiss_*.index + venues_v2.pkl)
+.
+├── app.py                  # Streamlit entry point (the UI)
 ├── requirements.txt
-├── runtime.txt            # python-3.11
+├── runtime.txt             # python-3.11
+├── README.md
 ├── .streamlit/
-│   ├── config.toml        # theme
+│   ├── config.toml         # theme
 │   └── secrets.toml.example
-├── .gitignore             # ignores secrets.toml
-└── sync_from_gustave.sh   # refresh engine+cache before a redeploy
+├── engine/                 # the search engine package
+│   ├── __init__.py
+│   ├── pipeline.py         # the 6-step search pipeline
+│   └── data/               # bundled search index
+│       ├── faiss_*.index   # 5 semantic indexes
+│       └── venues_v2.pkl   # venue data (names, reviews, links, ratings, geo)
+└── scripts/
+    └── refresh_data.sh     # re-sync engine + data from the main project
 ```
 
 ---
 
-## One-time deploy (≈10 min)
+## Deploy on Streamlit Community Cloud
 
-### 1. Put this folder on GitHub
-
-You need a free GitHub account. From a terminal:
-
-```bash
-cd /Users/andreidonko/Gustave/deploy
-git init -b main
-git add -A
-git commit -m "Gustave search — friends test build"
-```
-
-Create an **empty** repo on github.com (e.g. `gustave-search`, private is fine —
-Streamlit Cloud can read private repos), then:
-
-```bash
-git remote add origin https://github.com/<your-username>/gustave-search.git
-git push -u origin main
-```
-
-### 2. Deploy on Streamlit Community Cloud (free)
-
-1. Go to **https://share.streamlit.io** and sign in with GitHub.
-2. **Create app → Deploy a public app from GitHub** (works for private repos too).
-3. Select your `gustave-search` repo, branch `main`, **Main file path** `app.py`.
-4. Click **Advanced settings → Secrets** and paste (your real values):
+1. **[share.streamlit.io](https://share.streamlit.io)** → sign in with the GitHub
+   account that owns this repo → **Create app**.
+2. Repository **`gustavegpt/gustave-search`**, branch **`main`**, main file **`app.py`**.
+3. **Advanced settings → Secrets** — paste (your real values):
 
    ```toml
    ANTHROPIC_API_KEY = "sk-ant-..."
@@ -58,47 +42,29 @@ git push -u origin main
    GUSTAVE_DAILY_CAP   = "300"
    ```
 
-5. **Deploy.** First build takes a few minutes (it installs torch + downloads the
-   ~90 MB embedding model). When it's up you'll get a URL like
-   `https://gustave-search.streamlit.app`.
-
-### 3. Share with friends
-
-Send them the URL **and** the passcode. That's it.
+4. **Deploy.** First build takes a few minutes (installs torch + downloads the
+   embedding model). Share the resulting URL **and** the passcode with testers.
 
 ---
 
 ## Cost & limits
 
-- Every search runs the LLM pipeline on **your** Anthropic key — roughly a few
-  cents per search.
-- `GUSTAVE_SESSION_CAP` (default 25) limits one visitor per browser session.
-- `GUSTAVE_DAILY_CAP` (default 300) is a best-effort ceiling across everyone per
-  day (~a few £/day worst case). It resets daily and on app restart. Raise/lower
-  both in the Secrets panel anytime — no redeploy needed.
-- For a hard guarantee, create a **budget-limited Anthropic key** for this app.
+- Each search runs Claude on your key (~a few cents). `GUSTAVE_SESSION_CAP`
+  (default 25) caps one visitor per session; `GUSTAVE_DAILY_CAP` (default 300)
+  is a best-effort daily ceiling across everyone. Adjust both in Secrets — no
+  redeploy needed.
 
----
-
-## Updating the data or app later
-
-The `cache/` here is a snapshot. After more scraping / enrichment / link fixes
-in the main project, refresh and push:
+## Updating the data later
 
 ```bash
-cd /Users/andreidonko/Gustave/gustave && python3 embed_venues.py   # rebuild index
-cd ../deploy && ./sync_from_gustave.sh                             # copy engine+cache
-git add -A && git commit -m "refresh data" && git push             # auto-redeploys
+cd <gustave-project>/gustave && python3 embed_venues.py   # rebuild the index
+./scripts/refresh_data.sh                                 # copy engine + data here
+git add -A && git commit -m "refresh data" && git push    # auto-redeploys
 ```
 
-Streamlit Cloud redeploys automatically on every push to `main`.
-
----
-
-## Run locally first (optional)
+## Run locally
 
 ```bash
-cd deploy
 cp .streamlit/secrets.toml.example .streamlit/secrets.toml   # fill in real values
 python3 -m streamlit run app.py
 ```

@@ -1,0 +1,1 @@
+"""Gustave search engine package."""

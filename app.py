@@ -2,8 +2,8 @@
 Gustave — public search (friends test build)
 =============================================
 A lean, friend-facing version of the Gustave search UI for Streamlit
-Community Cloud. Reuses the real search pipeline (search_v2.py) but hides
-all developer surfaces (pipeline inspector, API-key box, eval log) and adds:
+Community Cloud. Reuses the real search pipeline (engine/pipeline.py) but
+hides all developer surfaces (pipeline inspector, API-key box, eval log) and adds:
 
   • a passcode gate (GUSTAVE_PASSCODE)
   • a per-session + per-day search cap so a shared link can't run up the
@@ -21,7 +21,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 # ── Bridge Streamlit secrets → env vars ───────────────────────────────────────
-# search_v2 reads os.environ; Streamlit Cloud exposes secrets via st.secrets.
+# The engine reads os.environ; Streamlit Cloud exposes secrets via st.secrets.
 # Accessing st.secrets with no secrets file raises, so guard it (local runs).
 try:
     _secrets = dict(st.secrets)
@@ -32,7 +32,7 @@ for _k in ("ANTHROPIC_API_KEY", "GUSTAVE_PASSCODE",
     if _k not in os.environ and _k in _secrets:
         os.environ[_k] = str(_secrets[_k])
 
-import search_v2  # noqa: E402  (after env bridge)
+from engine import pipeline  # noqa: E402  (after env bridge)
 
 st.set_page_config(page_title="Gustave — London restaurant search",
                    page_icon="🍽️", layout="wide")
@@ -94,7 +94,7 @@ if not os.environ.get("ANTHROPIC_API_KEY"):
     st.error("Search is temporarily unavailable (missing API configuration). "
              "Please let Andrei know.")
     st.stop()
-if not search_v2.indexes_ready():
+if not pipeline.indexes_ready():
     st.error("Search index unavailable. Please let Andrei know.")
     st.stop()
 
@@ -259,7 +259,7 @@ if nav == "🗺️ Browse all":
     @st.cache_data(show_spinner=False)
     def _all_venues():
         import pandas as pd
-        df = pd.read_pickle("cache/venues_v2.pkl")
+        df = pd.read_pickle("engine/data/venues_v2.pkl")
         df = df.copy()
         df["Restaurant"] = df["Restaurant"].astype(str).str.strip("'\"")
         for c in ("Latitude", "Longitude"):
@@ -334,7 +334,7 @@ if go and query.strip():
         st.warning(msg)
         st.stop()
     with st.spinner("Searching London's best reviews …"):
-        results, _debug = search_v2.search(query, top_k=15, use_llm=True)
+        results, _debug = pipeline.search(query, top_k=15, use_llm=True)
     _record_search()
     # Persist so a map-marker click (which reruns) keeps the results.
     st.session_state["_results"] = results

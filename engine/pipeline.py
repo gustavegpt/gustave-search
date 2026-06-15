@@ -28,7 +28,7 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=True)
 
-CACHE_DIR = Path(__file__).parent / "cache"
+CACHE_DIR = Path(__file__).parent / "data"
 MODEL_NAME = "all-MiniLM-L6-v2"
 
 # When cuisine is explicitly in the query, venues must score at least this
