@@ -183,8 +183,9 @@ def _g(v: dict, *keys):
     return None
 
 
-def _render_card(v: dict) -> None:
-    """Render one venue card — used by search results and map-click popups."""
+def _render_card(v: dict, is_alt: bool = False) -> None:
+    """Render one venue card — used by search results and map-click popups.
+    is_alt=True leads with the caveat (why it's an alternative, not a full match)."""
     st.subheader(str(_g(v, "name", "Restaurant") or "—").strip("'\""))
     addr = _g(v, "address", "Area", "Address") or "London"
     src = _g(v, "source", "Appears on") or ""
@@ -194,6 +195,8 @@ def _render_card(v: dict) -> None:
         rc = _num(_g(v, "rating_count", "Rating_count"))
         cnt = f" · {int(rc):,} Google reviews" if rc else " · Google"
         st.caption(f"{_stars(rt)}  **{rt:g}**{cnt}")
+    if is_alt and v.get("caveat"):
+        st.warning(f"⚠️ **Doesn't tick:** {v['caveat']}")
     if v.get("llm_reason"):
         st.markdown(f"💡 *{v['llm_reason']}*")
     if v.get("review_snippet"):
@@ -345,10 +348,6 @@ if go and query.strip():
         search_log.log_search(query, _debug, results, report_text=_report, source="live")
     except Exception:
         pass
-    # The engine may return "alternatives" (meets=False) after the matches once
-    # the division graduates. Until the two-bucket UI ships to live, show only
-    # the confirmed matches. (No-op on the older engine, which has no 'meets'.)
-    results = [r for r in results if r.get("meets", True)]
     # Persist so a map-marker click (which reruns) keeps the results.
     st.session_state["_results"] = results
     st.session_state["_query"] = query
@@ -359,7 +358,8 @@ elif go:
 results = st.session_state.get("_results")
 qy = st.session_state.get("_query", "")
 if results:
-    st.markdown(f"**{len(results)} places** for *{qy}*")
+    matches = [r for r in results if r.get("meets", True)]
+    alternatives = [r for r in results if not r.get("meets", True)]
 
     # Map of the results — hover for a name, click a dot to open its card.
     import pandas as pd
@@ -389,10 +389,55 @@ if results:
             st.markdown("**📍 Selected on map**")
             with st.container(border=True):
                 _render_card(picked)
+    # ── Bucket 1: matches everything you asked for ──────────────────────
+    if alternatives:
+        st.markdown(f"### ✅ Matches what you asked for  ·  {len(matches)}")
+        st.caption("These satisfy every requirement in your search.")
+    else:
+        st.markdown(f"**{len(matches)} places** for *{qy}*")
     st.divider()
-    for r in results:
-        _render_card(r)
+    if matches:
+        for r in matches:
+            _render_card(r)
+            st.divider()
+    else:
+        st.info("Nothing matched every requirement exactly — see the suggestions below.")
+
+    # ── Bucket 2: good fits that miss / can't-confirm one requirement ────
+    if alternatives:
+        st.markdown(f"### 💡 Also worth a look  ·  {len(alternatives)}")
+        st.caption("Strong matches that miss — or that we can't confirm satisfy — one of your requirements.")
         st.divider()
+        for r in alternatives:
+            _render_card(r, is_alt=True)
+            st.divider()
+
+# ── Feedback: report a miss / suggest a fix → feeds the learning loop ────────
+st.divider()
+with st.expander("💬 Spotted a miss? Help improve Gustave", expanded=False):
+    st.caption("If a search missed a place it should have shown, tell us — it goes "
+               "straight into Gustave's learning loop.")
+    with st.form("feedback_form", clear_on_submit=True):
+        fb_q = st.text_input("The search you ran", value=st.session_state.get("_query", ""))
+        fb_v = st.text_input("Place(s) that should have appeared (comma-separated)")
+        fb_n = st.text_area("Anything else? (optional)", height=70)
+        sent = st.form_submit_button("Send feedback")
+    if sent:
+        venues = [v.strip() for v in fb_v.split(",") if v.strip()]
+        if not (fb_q.strip() and venues):
+            st.warning("Add the search and at least one place that should have appeared.")
+        else:
+            try:
+                import learn_core
+                from datetime import datetime
+                learn_core.append_learning({
+                    "id": datetime.now().strftime("%Y-%m-%d-%H%M%S"),
+                    "date": datetime.now().strftime("%Y-%m-%d"),
+                    "query": fb_q.strip(), "should_surface": venues,
+                    "note": fb_n.strip(), "source": "live", "status": "pending", "triage": None})
+                st.success("Thanks — logged! Andrei will take a look.")
+            except Exception as e:
+                st.caption(f"Couldn't save right now: {e}")
 
 st.caption("Gustave is an early test build — results and links are still being "
            "refined. Spotted something off? Tell Andrei.")
