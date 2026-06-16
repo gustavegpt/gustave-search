@@ -28,11 +28,13 @@ try:
 except Exception:
     _secrets = {}
 for _k in ("ANTHROPIC_API_KEY", "GUSTAVE_PASSCODE",
-           "GUSTAVE_SESSION_CAP", "GUSTAVE_DAILY_CAP"):
+           "GUSTAVE_SESSION_CAP", "GUSTAVE_DAILY_CAP",
+           "GUSTAVE_LOG_DB_URL"):
     if _k not in os.environ and _k in _secrets:
         os.environ[_k] = str(_secrets[_k])
 
 from engine import pipeline  # noqa: E402  (after env bridge)
+import search_log            # noqa: E402  (durable search log → Supabase/Postgres)
 
 st.set_page_config(page_title="Gustave — London restaurant search",
                    page_icon="🍽️", layout="wide")
@@ -336,6 +338,17 @@ if go and query.strip():
     with st.spinner("Searching London's best reviews …"):
         results, _debug = pipeline.search(query, top_k=15, use_llm=True)
     _record_search()
+    # Durably log the search + its full evaluation report (→ Supabase if
+    # GUSTAVE_LOG_DB_URL is set, else a local file). Never blocks a search.
+    try:
+        _report = pipeline.format_result_log(query, _debug, results)
+        search_log.log_search(query, _debug, results, report_text=_report, source="live")
+    except Exception:
+        pass
+    # The engine may return "alternatives" (meets=False) after the matches once
+    # the division graduates. Until the two-bucket UI ships to live, show only
+    # the confirmed matches. (No-op on the older engine, which has no 'meets'.)
+    results = [r for r in results if r.get("meets", True)]
     # Persist so a map-marker click (which reruns) keeps the results.
     st.session_state["_results"] = results
     st.session_state["_query"] = query

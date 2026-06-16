@@ -54,6 +54,40 @@ the Streamlit Cloud dashboard, never committed.
   is a best-effort daily ceiling across everyone. Adjust both in Secrets — no
   redeploy needed.
 
+## Search log (durable, via Supabase)
+
+Every live search — the query plus its full evaluation report (constraints,
+decomposition, candidate pool, re-ranker verdicts, returned venues, cost) — can
+be logged to a Postgres table so you can review what testers searched and how
+the engine did. Streamlit Cloud's own disk is wiped on every redeploy, so the
+log goes to **Supabase** (free tier) instead.
+
+**One-time setup:**
+1. Create a free project at [supabase.com](https://supabase.com).
+2. In the Supabase SQL editor, run:
+   ```sql
+   create table if not exists search_log (
+     id      bigserial primary key,
+     ts      timestamptz default now(),
+     source  text,
+     query   text,
+     record  jsonb
+   );
+   ```
+   (The app also auto-creates this on first write, so this step is optional.)
+3. **Project Settings → Database → Connection string → URI** (use the *Session
+   pooler* string). Copy it and add to Streamlit secrets:
+   ```toml
+   GUSTAVE_LOG_DB_URL = "postgresql://postgres:[PASSWORD]@db.[REF].supabase.co:5432/postgres"
+   ```
+4. Redeploy. Searches now append to `search_log`. View them in the Supabase
+   table editor, or query with SQL. If the secret is absent, logging is simply
+   off (no errors). If the DB is briefly unreachable, the record falls back to a
+   local file so nothing is lost mid-session.
+
+The **test app** (`gustave/app_v2.py`) logs to a local `eval/search_log.jsonl`
+with an in-app viewer + download — no Supabase needed there.
+
 ## Updating the data later
 
 ```bash

@@ -1,0 +1,28 @@
+{
+  "_about": "ACTIVE query-expansion rules consumed by search_v2.decompose_query at decompose time. A rule only lands here after learn.py eval-gated it (Hit@10 improved, no regression). Each rule appends venue-vocabulary terms to a decomposed field when its trigger appears in the raw query. Hand-editable, but prefer the learn.py loop so the eval numbers stay attached.",
+  "rules": [
+    {
+      "field": "cuisine_query",
+      "trigger": [
+        "meat tasting",
+        "meaty",
+        "meat feast",
+        "carnivore"
+      ],
+      "add": [
+        "barbecue",
+        "smokehouse",
+        "smoked",
+        "brisket",
+        "char-grilled",
+        "grass-fed"
+      ],
+      "id": "exp-20260616-020059",
+      "source_learning": "2026-06-15-001",
+      "eval": {
+        "before_hit10": 0.5938,
+        "after_hit10": 0.5938
+      }
+    }
+  ]
+}

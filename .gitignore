@@ -3,3 +3,7 @@ __pycache__/
 *.pyc
 .DS_Store
 .env
+# runtime artifacts (never commit)
+engine/data/query_cache.pkl
+eval/search_log.jsonl
+eval/learnings.json

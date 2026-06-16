@@ -20,11 +20,16 @@ from __future__ import annotations
 import os
 import json
 import re
+import hashlib
+import pickle
 import numpy as np
 import pandas as pd
 import faiss
 from pathlib import Path
 from dotenv import load_dotenv
+
+import learn_core
+import geo_zones
 
 load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=True)
 
@@ -42,6 +47,29 @@ CUISINE_GATE_RATIO = 0.45
 # when the LLM pipeline is ON (the re-ranker can only return venues it scored).
 DEFAULT_TOP_K = 20
 RERANK_POOL   = 20
+
+# How many "alternatives" (venues that miss/can't-confirm a stated hard
+# requirement) to surface after the matches. 0 hard requirements → no alternatives.
+ALT_POOL = 8
+
+# Minimum LLM re-ranker score (0-10) a venue must reach to be shown at all. The
+# rubric caps wrong-cuisine at 4 and loose/peripheral matches at 3-4; a 5 means
+# "matches the cuisine but misses another dimension". A floor of 6 keeps only
+# relatively-good matches and drops the weak padding the re-ranker already flagged.
+# We show as many relevant venues as exist (up to top_k), not a fixed count. Tunable.
+RELEVANCE_MIN = 6.0
+
+# Location-aware search — OFF by default. The expensive search stays
+# location-agnostic; when enabled (per-call location_mode=True, or this flag),
+# a cheap post-step restricts results to the requested area/zone and reuses the
+# cached base across locations. Keep False until tested via the app toggle.
+LOCATION_ENABLED = False
+# When location filtering is on, pull a deeper pool and keep an embedding-ranked
+# tail in the base, so the location restrict has venues across every zone (not
+# just the top ~20 reranked). Tail venues carry embedding scores (no LLM rerank),
+# surfaced under "nearby" once the strong in-area matches run out.
+LOCATION_POOL = 300
+LOCATION_TAIL = 120
 
 # ── Cost estimation ────────────────────────────────────────────────────────
 # Anthropic does NOT expose a remaining-credit/balance API. We instead estimate
@@ -125,6 +153,75 @@ def indexes_ready() -> bool:
 
 
 # ─────────────────────────────────────────────
+# QUERY CACHE
+# Searches are deterministic at temperature=0, so an identical query returns the
+# same result — caching makes repeated searches FREE (no Claude calls). The key
+# folds in a content hash of the venue data, the active expansion rules, AND this
+# file's mtime, so the cache invalidates automatically when any of them change
+# (this also keeps the self-learning eval gate correct: its in-memory expansion
+# swaps produce different keys, and editing the pipeline busts every entry).
+# ─────────────────────────────────────────────
+_QUERY_CACHE: dict = {}
+_QUERY_CACHE_LOADED = False
+_QUERY_CACHE_PATH = CACHE_DIR / "query_cache.pkl"
+
+
+def _data_version() -> str:
+    parts = []
+    for p in (CACHE_DIR / "venues_v2.pkl", Path(__file__)):
+        try:
+            parts.append(str(int(p.stat().st_mtime)))
+        except Exception:
+            parts.append("0")
+    try:
+        exp = learn_core.load_expansions()
+        parts.append(hashlib.md5(json.dumps(exp, sort_keys=True).encode()).hexdigest()[:8])
+    except Exception:
+        parts.append("0")
+    return hashlib.md5("|".join(parts).encode()).hexdigest()[:12]
+
+
+def _cache_key(query: str, top_k: int, use_llm: bool) -> str:
+    norm = " ".join((query or "").lower().split())
+    return f"{_data_version()}:{top_k}:{int(use_llm)}:{norm}"
+
+
+def _load_query_cache() -> None:
+    global _QUERY_CACHE, _QUERY_CACHE_LOADED
+    if _QUERY_CACHE_LOADED:
+        return
+    _QUERY_CACHE_LOADED = True
+    try:
+        with open(_QUERY_CACHE_PATH, "rb") as f:
+            _QUERY_CACHE = pickle.load(f)
+    except Exception:
+        _QUERY_CACHE = {}
+
+
+def _save_query_cache() -> None:
+    try:
+        tmp = _QUERY_CACHE_PATH.with_suffix(".pkl.tmp")
+        with open(tmp, "wb") as f:
+            pickle.dump(_QUERY_CACHE, f)
+        tmp.replace(_QUERY_CACHE_PATH)
+    except Exception:
+        pass
+
+
+def clear_query_cache() -> int:
+    """Wipe the cache (memory + disk). Returns how many entries were cleared."""
+    global _QUERY_CACHE
+    _load_query_cache()
+    n = len(_QUERY_CACHE)
+    _QUERY_CACHE = {}
+    try:
+        _QUERY_CACHE_PATH.unlink()
+    except Exception:
+        pass
+    return n
+
+
+# ─────────────────────────────────────────────
 # CLAUDE API HELPER
 # ─────────────────────────────────────────────
 _last_claude_error: str = ""
@@ -136,6 +233,11 @@ _last_claude_raw: str = ""   # stores the raw response for debugging
 # keyword-based _fallback_decompose() — either because _claude() failed
 # or because Claude returned non-JSON. Surfaced in the inspector.
 _last_used_fallback: bool = False
+
+# Set by decompose_query() to the list of expansion rules that fired for the
+# current query (from eval/expansions.json via learn_core). Surfaced in the
+# inspector so you can see exactly what vocabulary the learning loop injected.
+_last_expansions_applied: list = []
 
 
 def _strip_markdown_json(text: str) -> str:
@@ -342,8 +444,9 @@ def _fallback_decompose(query: str) -> dict:
 
 
 def decompose_query(query: str) -> dict:
-    global _last_used_fallback
+    global _last_used_fallback, _last_expansions_applied
     _last_used_fallback = False
+    _last_expansions_applied = []
     defaults = {
         "vibe_query":      None,
         "cuisine_query":   None,
@@ -355,13 +458,88 @@ def decompose_query(query: str) -> dict:
     raw = _claude(query, _DECOMPOSE_SYSTEM, temperature=0.0)
     if not raw:
         _last_used_fallback = True
-        return {**defaults, **_fallback_decompose(query)}
-    try:
-        parsed = json.loads(raw)
-        return {**defaults, **parsed}
-    except Exception:
+        base = {**defaults, **_fallback_decompose(query)}
+    else:
+        try:
+            base = {**defaults, **json.loads(raw)}
+        except Exception:
+            _last_used_fallback = True
+            base = {**defaults, **_fallback_decompose(query)}
+
+    # Self-learning loop: inject confirmed expansion vocabulary so the candidate
+    # pool surfaces venues whose own language differs from the user's phrasing
+    # (e.g. "meat tasting menu" → also barbecue / smokehouse / grill).
+    expanded, applied = learn_core.apply_expansions(query, base)
+    _last_expansions_applied = applied
+    return expanded
+
+
+# ─────────────────────────────────────────────
+# STEPS 1 + 2 COMBINED — single-call query understanding (cost reduction)
+# Constraint extraction and decomposition are two separate Claude calls; merging
+# them into one cuts a search from 3 Claude calls to 2 (~⅓ fewer calls) with no
+# loss of information. The standalone extract_constraints / decompose_query above
+# are kept for reference/eval; search() uses this combined call.
+# ─────────────────────────────────────────────
+_UNDERSTAND_SYSTEM = """You parse a London restaurant search query into (A) hard binary
+constraints and (B) semantic dimensions, in ONE pass. Return valid JSON with EXACTLY these keys:
+
+HARD CONSTRAINTS — binary; only set when EXPLICITLY present, never infer:
+  dietary:       list from [vegan, vegetarian, halal, gluten-free, kosher]   (else [])
+  price_max:     one of [budget, ££, £££] or null
+  open_on:       day name e.g. "Monday" or null
+  meal_service:  one of [breakfast, brunch, lunch, dinner, drinks] or null
+
+SEMANTIC DIMENSIONS — short strings (2-5 words) or null:
+  vibe_query:      mood/atmosphere/setting (romantic, lively, cosy) — NO cost words
+  cuisine_query:   food type or dishes (Italian, sushi, pizza)
+  occasion_query:  occasion/group (date night, birthday, business) — NO cost words
+  location_query:  neighbourhood/area/landmark (Soho, Shoreditch)
+  key_facts_query: proper nouns — chef/owner names, sister/parent venues, awards (Michelin), TV credits
+  cost_query:      ANY price stipulation (cheap, splurge, "under £50pp") — cost words go ONLY here
+
+Rules:
+- price_max ONLY on explicit price language: "cheap/budget/inexpensive"→budget; "not too expensive/mid-range/reasonable"→££; "splurge/expensive/fine dining/blowout/treat ourselves"→£££. "special/nice/lovely/intimate/for a date/romantic" do NOT imply price → leave null.
+- meal_service: "dinner/supper/evening meal"→dinner; "lunch/midday"→lunch; "breakfast/morning"→breakfast; "brunch"→brunch; "drinks/cocktails/bar"→drinks.
+- Dietary words go ONLY in `dietary` — never in cuisine_query.
+- Never leak cost language into vibe_query or occasion_query — it belongs in cost_query (and price_max if a tier).
+- Anything not clearly present → null (or [] for dietary).
+- Return ONLY valid JSON. No explanation."""
+
+_CONSTRAINT_KEYS = {"dietary": [], "price_max": None, "open_on": None, "meal_service": None}
+_DECOMPOSE_KEYS = {
+    "vibe_query": None, "cuisine_query": None, "occasion_query": None,
+    "location_query": None, "key_facts_query": None, "cost_query": None,
+}
+
+
+def understand_query(query: str) -> tuple:
+    """ONE Claude call → (constraints, decomposed). Replaces the two separate
+    extract_constraints + decompose_query calls inside search()."""
+    global _last_used_fallback, _last_expansions_applied
+    _last_used_fallback = False
+    _last_expansions_applied = []
+
+    raw = _claude(query, _UNDERSTAND_SYSTEM, temperature=0.0)
+    if not raw:
         _last_used_fallback = True
-        return {**defaults, **_fallback_decompose(query)}
+        constraints = dict(_CONSTRAINT_KEYS)
+        decomposed = {**_DECOMPOSE_KEYS, **_fallback_decompose(query)}
+    else:
+        try:
+            parsed = json.loads(raw)
+            constraints = {k: parsed.get(k, default) for k, default in _CONSTRAINT_KEYS.items()}
+            if not isinstance(constraints["dietary"], list):
+                constraints["dietary"] = []
+            decomposed = {k: parsed.get(k) for k in _DECOMPOSE_KEYS}
+        except Exception:
+            _last_used_fallback = True
+            constraints = dict(_CONSTRAINT_KEYS)
+            decomposed = {**_DECOMPOSE_KEYS, **_fallback_decompose(query)}
+
+    expanded, applied = learn_core.apply_expansions(query, decomposed)
+    _last_expansions_applied = applied
+    return constraints, expanded
 
 
 # ─────────────────────────────────────────────
@@ -709,9 +887,23 @@ the profile fields. Cite ONLY dimensions that appear in the parsed intent — ne
 claim a match or mismatch on a dimension the user did not ask for. Do NOT mention
 location.
 
+HARD-REQUIREMENT VERDICT — set "meets" and "caveat" for each candidate:
+- The HARD requirements are ONLY these, and ONLY when the parsed intent lists them:
+  dietary, price ceiling, meal service. (Cuisine is already enforced upstream.)
+- "meets": true  → the candidate satisfies EVERY hard requirement the user stated
+  (positive evidence for the diet, price not contradicted, serves the meal).
+- "meets": false → it misses or cannot confirm at least one hard requirement,
+  even though it may be an excellent match otherwise (a worthwhile alternative).
+- If the parsed intent lists NO hard requirements (no dietary, no price ceiling,
+  no meal service), set "meets": true for every candidate — there is nothing to miss.
+- "caveat": when meets=false, a ≤12-word phrase naming the ONE thing it doesn't
+  tick, phrased for a diner — e.g. "can't confirm vegan options", "likely above
+  your budget", "may not serve lunch". Empty string when meets=true.
+
 Return ONLY a valid JSON array, sorted by score descending, using the candidate
 id number you were given (NOT the name):
-[{"id": 3, "score": 9, "reason": "..."}, {"id": 1, "score": 6, "reason": "..."}]
+[{"id": 3, "score": 9, "reason": "...", "meets": true, "caveat": ""},
+ {"id": 1, "score": 6, "reason": "...", "meets": false, "caveat": "can't confirm halal"}]
 No prose outside the JSON."""
 
 
@@ -810,12 +1002,12 @@ def llm_rerank(
 
     intent_block = _format_intent(query, constraints, decomposed)
     prompt = f"{intent_block}\n\nCandidates:\n" + "\n\n".join(candidate_lines)
-    # ~120 output tokens per candidate (score + 25-word reason) plus headroom.
-    rerank_tokens = min(4000, 400 + 130 * len(pool))
+    # ~150 output tokens per candidate (score + 25-word reason + caveat) plus headroom.
+    rerank_tokens = min(4500, 400 + 160 * len(pool))
     raw = _claude(prompt, _RERANK_SYSTEM, max_tokens=rerank_tokens, temperature=0.0)
 
     if not raw:
-        return [(vid, 0.0, "") for vid, _ in pool], []
+        return [(vid, 0.0, "", True, "") for vid, _ in pool], []
 
     try:
         ranked = json.loads(raw)
@@ -825,30 +1017,38 @@ def llm_rerank(
                 rid = int(r["id"])
             except (KeyError, ValueError, TypeError):
                 continue
+            # Default meets=True so a model that omits the field never spuriously
+            # demotes a venue into the alternatives bucket.
+            meets = r.get("meets", True)
+            meets = bool(meets) if isinstance(meets, bool) else str(meets).strip().lower() not in ("false", "0", "no", "")
             id_to_info[rid] = (
                 float(r.get("score", 0.0)),
                 str(r.get("reason", "")).strip(),
+                meets,
+                str(r.get("caveat", "")).strip(),
             )
 
         reranked = []
         reranker_scores = []
         for cid, (vid, embed_score) in enumerate(pool, 1):
             name = str(df.iloc[vid].get("Restaurant", "")).strip("'\"")
-            llm_score, llm_reason = id_to_info.get(cid, (0.0, ""))
-            reranked.append((vid, llm_score, llm_reason))
+            llm_score, llm_reason, meets, caveat = id_to_info.get(cid, (0.0, "", True, ""))
+            reranked.append((vid, llm_score, llm_reason, meets, caveat))
             reranker_scores.append({
                 "name": name,
                 "embedding_rank": cid,
                 "embedding_score": round(embed_score, 4),
                 "llm_score": llm_score,
                 "llm_reason": llm_reason,
+                "meets": meets,
+                "caveat": caveat,
             })
 
         reranked.sort(key=lambda x: x[1], reverse=True)
         reranker_scores.sort(key=lambda x: x["llm_score"], reverse=True)
         return reranked[:RERANK_POOL], reranker_scores
     except Exception:
-        return [(vid, 0.0, "") for vid, _ in pool], []
+        return [(vid, 0.0, "", True, "") for vid, _ in pool], []
 
 
 # ─────────────────────────────────────────────
@@ -857,9 +1057,12 @@ def llm_rerank(
 def format_results(final: list, df: pd.DataFrame) -> list:
     results = []
     for item in final:
-        # Accept 2-tuples (no LLM rerank — use_llm=False)
-        # or 3-tuples (with rerank reason)
-        if len(item) == 3:
+        # Accept 2-tuples (no LLM rerank — use_llm=False), 3-tuples (legacy
+        # rerank reason), or 5-tuples (rerank reason + meets/caveat verdict).
+        meets, caveat = True, ""
+        if len(item) == 5:
+            vid, score, reason, meets, caveat = item
+        elif len(item) == 3:
             vid, score, reason = item
         else:
             vid, score = item
@@ -883,35 +1086,91 @@ def format_results(final: list, df: pd.DataFrame) -> list:
             "longitude": row.get("Longitude"),
             "score": round(score, 3),
             "llm_reason": reason,
+            "meets": bool(meets),
+            "caveat": caveat,
         })
     return results
 
 
 # ─────────────────────────────────────────────
+# LOCATION RESTRICT  (cheap post-step on the location-agnostic base; OFF by default)
+# ─────────────────────────────────────────────
+def _apply_location(results: list, debug: dict, loc: dict | None) -> tuple:
+    """Restrict an already-ranked, location-agnostic result set to a requested
+    area/zone. No API — pure reorder + tag. When loc is None (location off, or no
+    area named), returns the base unchanged. Does not mutate the cached base."""
+    if not loc:
+        return results, debug
+    partitioned = geo_zones.partition_by_location(results, loc)
+    new_debug = dict(debug)
+    new_debug["location"] = {
+        "requested": loc.get("raw"),
+        "zone":      loc.get("zone"),
+        "area":      loc.get("area"),
+        "in_count":  sum(1 for r in partitioned if r.get("in_location")),
+        "near_count": sum(1 for r in partitioned if r.get("near_location")),
+        "total":     len(partitioned),
+    }
+    return partitioned, new_debug
+
+
+# ─────────────────────────────────────────────
 # MAIN SEARCH FUNCTION
 # ─────────────────────────────────────────────
-def search(query: str, top_k: int = DEFAULT_TOP_K, use_llm: bool = True) -> tuple:
+def search(query: str, top_k: int = DEFAULT_TOP_K, use_llm: bool = True,
+           use_cache: bool = True, location_mode: bool | None = None) -> tuple:
     """
     Full 6-step Gustave search pipeline.
     Returns (results: list, debug: dict)
+
+    use_cache: serve an identical prior query from the result cache (free — no
+    Claude calls). The cache key invalidates on data/expansion/code changes.
+    location_mode: override LOCATION_ENABLED for this call. When location-aware
+    search is active and the query names an area/zone, the (location-agnostic)
+    base result is restricted to that location as a cheap post-step — and the
+    base is cached under the location-stripped query so locations share it.
     """
     if not indexes_ready():
         return [], {"error": "Indexes not built. Run: python embed_venues.py"}
 
     _reset_last_search_usage()
+
+    loc_active = LOCATION_ENABLED if location_mode is None else location_mode
+    loc = geo_zones.extract_location(query) if loc_active else None
+    # Cache the location-AGNOSTIC base under the location-stripped query so
+    # different locations reuse the same expensive computation.
+    base_query = geo_zones.strip_location(query) if loc else query
+
+    # Query cache — identical queries are deterministic, so reuse the stored
+    # base result with zero API cost.
+    ckey = _cache_key(base_query, top_k, use_llm) if use_cache else None
+    results = None
+    debug: dict = {}
+    if ckey is not None:
+        _load_query_cache()
+        hit = _QUERY_CACHE.get(ckey)
+        if hit is not None:
+            results, cached_debug = hit
+            debug = dict(cached_debug)
+            debug["cached"] = True
+
+    if results is not None:
+        return _apply_location(results, debug, loc)
+
     model, indexes, df = _load_resources()
-    debug = {}
 
-    # Step 1
-    constraints = extract_constraints(query)
+    # Steps 1 + 2 — single combined query-understanding call (constraints +
+    # decomposition in one Claude call instead of two).
+    constraints, decomposed = understand_query(query)
     debug["constraints"] = constraints
-
-    # Step 2
-    decomposed = decompose_query(query)
     debug["decomposed"] = decomposed
+    debug["expansions_applied"] = list(_last_expansions_applied)
 
-    # Steps 3 + 4
-    candidates, dim_scores_map = multi_embedding_search(decomposed, constraints, model, indexes, df)
+    # Steps 3 + 4 — deeper pool when location filtering is on, so the restrict
+    # step has venues across every zone to draw from.
+    cpool = LOCATION_POOL if loc_active else 50
+    candidates, dim_scores_map = multi_embedding_search(
+        decomposed, constraints, model, indexes, df, candidate_pool=cpool)
     debug["candidate_pool"] = [
         {
             "name": str(df.iloc[vid].get("Restaurant", "")).strip("'\""),
@@ -924,17 +1183,44 @@ def search(query: str, top_k: int = DEFAULT_TOP_K, use_llm: bool = True) -> tupl
     # Step 5 — LLM rerank top RERANK_POOL candidates against enriched profiles
     if use_llm and len(candidates) > 1:
         reranked, rerank_debug = llm_rerank(query, candidates[:RERANK_POOL], df, constraints, decomposed)
-        final = reranked[:top_k] if reranked else candidates[:top_k]
         debug["reranker_scores"] = rerank_debug
+        if reranked:
+            # Relevance floor: drop venues the re-ranker scored below RELEVANCE_MIN
+            # (wrong cuisine, one-token / peripheral matches). We show as many
+            # relevant venues as exist — never pad to a fixed count with weak ones.
+            relevant = [r for r in reranked if (r[1] if len(r) > 1 else 0) >= RELEVANCE_MIN]
+            debug["dropped_low_relevance"] = len(reranked) - len(relevant)
+            # Division: split on the re-ranker's hard-requirement verdict. Venues
+            # that satisfy every stated hard requirement are "matches"; the rest
+            # are surfaced afterwards as labelled alternatives (good fits that
+            # miss/can't-confirm a hard requirement). Both stay score-ordered.
+            matches = [r for r in relevant if len(r) >= 4 and r[3]]
+            alts    = [r for r in relevant if len(r) >= 4 and not r[3]]
+            final = matches[:top_k] + alts[:ALT_POOL]
+        else:
+            final = candidates[:top_k]
     else:
         final = candidates[:top_k]
         debug["reranker_scores"] = []
 
-    debug["final_count"] = len(final)
+    # Location mode: extend the base with an embedding-ranked tail so the restrict
+    # step can find venues in the requested area beyond the top reranked few.
+    if loc_active:
+        seen = {f[0] for f in final}
+        tail = [(vid, sc) for vid, sc in candidates[:LOCATION_TAIL] if vid not in seen]
+        final = final + tail
 
     # Step 6
-    results = format_results(final[:top_k], df)
-    return results, debug
+    results = format_results(final, df)
+    debug["match_count"] = sum(1 for r in results if r.get("meets"))
+    debug["alt_count"]   = sum(1 for r in results if not r.get("meets"))
+    debug["final_count"] = len(results)
+    debug["cached"] = False
+
+    if ckey is not None:
+        _QUERY_CACHE[ckey] = (results, debug)
+        _save_query_cache()
+    return _apply_location(results, debug, loc)
 
 
 # ─────────────────────────────────────────────
