@@ -29,12 +29,13 @@ except Exception:
     _secrets = {}
 for _k in ("ANTHROPIC_API_KEY", "GUSTAVE_PASSCODE",
            "GUSTAVE_SESSION_CAP", "GUSTAVE_DAILY_CAP",
-           "GUSTAVE_LOG_DB_URL"):
+           "GUSTAVE_LOG_DB_URL", "GUSTAVE_ADMIN_KEY",
+           "GUSTAVE_LOG_GIST_ID", "GUSTAVE_LOG_GH_TOKEN"):
     if _k not in os.environ and _k in _secrets:
         os.environ[_k] = str(_secrets[_k])
 
 from engine import pipeline  # noqa: E402  (after env bridge)
-import search_log            # noqa: E402  (durable search log → Supabase/Postgres)
+import search_log            # noqa: E402  (search + feedback log; local file by default)
 
 st.set_page_config(page_title="Gustave — London restaurant search",
                    page_icon="🍽️", layout="wide")
@@ -103,6 +104,33 @@ if not pipeline.indexes_ready():
 nav = st.radio("Navigation", ["🔎 Search", "🗺️ Browse all"],
                horizontal=True, label_visibility="collapsed", key="nav")
 st.divider()
+
+# ── Admin: view + download captured searches & feedback (gated by GUSTAVE_ADMIN_KEY) ──
+_admin_key = os.environ.get("GUSTAVE_ADMIN_KEY")
+if _admin_key:
+    with st.sidebar:
+        st.markdown("**🔒 Admin**")
+        if st.text_input("Admin key", type="password", key="_adminkey") == _admin_key:
+            _rows = search_log.load_log()
+            st.caption(f"📜 {len(_rows)} searches logged")
+            try:
+                st.download_button("⬇ Search log (JSONL)", search_log.LOG_PATH.read_bytes(),
+                                   file_name="gustave_search_log.jsonl", mime="application/json",
+                                   use_container_width=True)
+            except Exception:
+                st.caption("No search log yet.")
+            try:
+                import learn_core
+                _fb = learn_core.load_learnings().get("learnings", [])
+                st.caption(f"💬 {len(_fb)} feedback entries")
+                if _fb:
+                    st.download_button("⬇ Feedback (learnings.json)",
+                                       learn_core.LEARNINGS_PATH.read_bytes(),
+                                       file_name="learnings.json", mime="application/json",
+                                       use_container_width=True)
+            except Exception:
+                st.caption("No feedback yet.")
+            st.caption("⚠️ Cloud storage resets on redeploy — download to keep.")
 
 
 def _ig_handle(url: str) -> str:
@@ -346,6 +374,13 @@ if go and query.strip():
     try:
         _report = pipeline.format_result_log(query, _debug, results)
         search_log.log_search(query, _debug, results, report_text=_report, source="live")
+        import cloud_log  # durable mirror to gist (survives redeploys)
+        cloud_log.append("searches.jsonl", {
+            "query": query,
+            "matches": _debug.get("match_count"), "alts": _debug.get("alt_count"),
+            "decomposed": _debug.get("decomposed"),
+            "results": [r.get("name") for r in results],
+        })
     except Exception:
         pass
     # Persist so a map-marker click (which reruns) keeps the results.
@@ -358,8 +393,9 @@ elif go:
 results = st.session_state.get("_results")
 qy = st.session_state.get("_query", "")
 if results:
-    matches = [r for r in results if r.get("meets", True)]
-    alternatives = [r for r in results if not r.get("meets", True)]
+    matches = [r for r in results if not r.get("is_more") and not r.get("is_alt", not r.get("meets", True))]
+    alternatives = [r for r in results if not r.get("is_more") and r.get("is_alt", not r.get("meets", True))]
+    more = [r for r in results if r.get("is_more")]
 
     # Map of the results — hover for a name, click a dot to open its card.
     import pandas as pd
@@ -410,6 +446,14 @@ if results:
         st.divider()
         for r in alternatives:
             _render_card(r, is_alt=True)
+
+    # ── Bucket 3: lazy-load tail — browse more options on demand ─────────
+    if more:
+        with st.expander(f"➕ Show {len(more)} more places that fit", expanded=False):
+            st.caption("Ranked by match but not individually re-scored — broaden your choice.")
+            for r in more:
+                _render_card(r)
+                st.divider()
             st.divider()
 
 # ── Feedback: report a miss / suggest a fix → feeds the learning loop ────────
@@ -428,13 +472,15 @@ with st.expander("💬 Spotted a miss? Help improve Gustave", expanded=False):
             st.warning("Add the search and at least one place that should have appeared.")
         else:
             try:
-                import learn_core
+                import learn_core, cloud_log
                 from datetime import datetime
-                learn_core.append_learning({
+                entry = {
                     "id": datetime.now().strftime("%Y-%m-%d-%H%M%S"),
                     "date": datetime.now().strftime("%Y-%m-%d"),
                     "query": fb_q.strip(), "should_surface": venues,
-                    "note": fb_n.strip(), "source": "live", "status": "pending", "triage": None})
+                    "note": fb_n.strip(), "source": "live", "status": "pending", "triage": None}
+                learn_core.append_learning(entry)          # local (ephemeral on cloud)
+                cloud_log.append("learnings.jsonl", entry)  # durable mirror to gist
                 st.success("Thanks — logged! Andrei will take a look.")
             except Exception as e:
                 st.caption(f"Couldn't save right now: {e}")

@@ -34,7 +34,8 @@ EVAL_DIR        = Path(__file__).parent / "eval"
 LEARNINGS_PATH  = EVAL_DIR / "learnings.json"
 EXPANSIONS_PATH = EVAL_DIR / "expansions.json"
 
-EXPANDABLE_FIELDS = {"cuisine_query", "vibe_query", "occasion_query", "key_facts_query"}
+EXPANDABLE_FIELDS = {"cuisine_query", "vibe_query", "occasion_query",
+                     "key_facts_query", "tags_query"}
 
 
 # ── load / save ───────────────────────────────────────────────────────────────

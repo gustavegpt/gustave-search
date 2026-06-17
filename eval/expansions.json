@@ -1,4 +1,13 @@
 {
-  "_about": "ACTIVE query-expansion rules consumed by search_v2.decompose_query at decompose time. RETIRED 2026-06-17: the category-tags dimension + format→occasion routing now handle abstraction-level matching soundly (meat lovers → meat venues, no per-query patches), so the meat expansion rule was removed. Kept empty as the mechanism remains available if a genuinely narrow vocabulary bridge is ever needed.",
-  "rules": []
+  "_about": "ACTIVE query-expansion rules consumed by search_v2.decompose_query at decompose time. These bridge a genuine vocabulary gap between how a diner phrases a query and how venues describe themselves, when the embedding abstraction alone misses. Each rule appends `add` terms to a decomposed `field` when any `trigger` substring appears in the raw query. Eval-gate before adding (see learn.py).",
+  "rules": [
+    {
+      "id": "exp-meat-bbq-20260617",
+      "field": "tags_query",
+      "trigger": ["meat", "carnivore", "meaty"],
+      "add": ["barbecue", "grill", "steakhouse", "chophouse", "smokehouse"],
+      "source_learning": "2026-06-15-001",
+      "note": "Bare 'meat-forward' embeds toward burger joints; BBQ/grill/steakhouse/chophouse venues (Smokestak, Temper, Blacklock) rank 200-1100 in the tags index and miss the top-100 retrieval cut. Adding meat sub-type vocabulary pulls them into the pool (7/8 into top-100, Smokestak rank 7). Verified 2026-06-17."
+    }
+  ]
 }

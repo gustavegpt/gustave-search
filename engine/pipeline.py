@@ -52,12 +52,28 @@ RERANK_POOL   = 20
 # requirement) to surface after the matches. 0 hard requirements → no alternatives.
 ALT_POOL = 8
 
+# Lazy-load "show more" tail. The re-ranker (LLM) only scores RERANK_POOL venues
+# to keep cost down, but the embedding stage ranks far more. MORE_POOL is how
+# many extra embedding-ranked venues we attach after the focused matches/alts so
+# the app can reveal them on demand (no LLM cost). RETRIEVAL_POOL is how deep the
+# embedding retrieval goes so that tail has real depth (e.g. 100+ pizza places).
+MORE_POOL = 60
+RETRIEVAL_POOL = 150
+
 # Minimum LLM re-ranker score (0-10) a venue must reach to be shown at all. The
 # rubric caps wrong-cuisine at 4 and loose/peripheral matches at 3-4; a 5 means
 # "matches the cuisine but misses another dimension". A floor of 6 keeps only
 # relatively-good matches and drops the weak padding the re-ranker already flagged.
 # We show as many relevant venues as exist (up to top_k), not a fixed count. Tunable.
 RELEVANCE_MIN = 6.0
+
+# The "💡 also worth a look" (alternatives) bucket gets its OWN, lower floor.
+# Near-misses — a meat grill for "meat tasting menu", a venue that can't confirm
+# the diet — score in the 4-5 band and would vanish under RELEVANCE_MIN, leaving
+# the two-bucket division empty. ALT_RELEVANCE_MIN keeps these as labelled
+# alternatives (with a caveat) instead of dropping them. Matches still need
+# RELEVANCE_MIN; only the alternatives bucket uses this lower bar.
+ALT_RELEVANCE_MIN = 4.0
 
 # Location-aware search — OFF by default. The expensive search stays
 # location-agnostic; when enabled (per-call location_mode=True, or this flag),
@@ -508,7 +524,11 @@ Rules:
 - price_max ONLY on explicit price language: "cheap/budget/inexpensive"→budget; "not too expensive/mid-range/reasonable"→££; "splurge/expensive/fine dining/blowout/treat ourselves"→£££. "special/nice/lovely/intimate/for a date/romantic" do NOT imply price → leave null.
 - meal_service: "dinner/supper/evening meal"→dinner; "lunch/midday"→lunch; "breakfast/morning"→breakfast; "brunch"→brunch; "drinks/cocktails/bar"→drinks.
 - Dietary words go ONLY in `dietary` — never in cuisine_query.
-- Dining FORMAT words (tasting menu, chef's table, omakase, set menu, à la carte, counter dining, small plates) go ONLY in occasion_query — NEVER in cuisine_query or tags_query. So "meat tasting menu" → tags_query "meat-forward", occasion_query "tasting menu" (not "meat tasting menu").
+- Dining FORMAT words (tasting menu, chef's table, omakase, set menu, à la carte, counter dining, small plates) go ONLY in occasion_query — NEVER in cuisine_query or tags_query.
+- occasion_query must hold ONLY the bare occasion/format. STRIP every food, protein, cuisine, or vibe adjective out of it and route that word to its own field (tags_query / cuisine_query / vibe_query). The occasion embedding is polluted otherwise — "meat-centric tasting menu" left whole retrieves burger joints, not tasting menus. Examples:
+    · "meat tasting menu" / "meat-centric tasting menu" / "carnivore tasting menu" → occasion_query "tasting menu", tags_query "meat-forward". NEVER "meat tasting menu" in occasion_query.
+    · "seafood chef's table" → occasion_query "chef's table", tags_query "seafood-led".
+    · "romantic tasting menu" → occasion_query "tasting menu", vibe_query "romantic".
 - Never leak cost language into vibe_query or occasion_query — it belongs in cost_query (and price_max if a tier).
 - Anything not clearly present → null (or [] for dietary).
 - Return ONLY valid JSON. No explanation."""
@@ -748,11 +768,15 @@ def multi_embedding_search(
         dim_score_sets.append(scores)
         dim_labels.append(dim_key)
 
-    # Intersect: venue must appear in ALL active dimension results
+    # Pool = UNION of every active dimension's top matches. A strict intersection
+    # starves multi-dimension queries: "meat-centric tasting menu" (occasion) ∩
+    # "meat-forward" (tags) collapsed to 8 burger joints, so the fine-dining meat
+    # tasting menus never reached the re-ranker — no variety, no alternatives.
+    # The union keeps the pool rich; the combined score below still ranks venues
+    # that match MORE dimensions (and score higher on each) to the top, so the
+    # focused recommendations lead and the broader options fill out the tail.
     all_sets = [set(d.keys()) for d in dim_score_sets]
-    intersected = set.intersection(*all_sets) if all_sets else set()
-    if len(intersected) < 8:
-        intersected = set.union(*all_sets)
+    pooled = set.union(*all_sets) if all_sets else set()
 
     # ── Cuisine hard gate ──────────────────────────────────────────────────
     # If the user specified a cuisine, venues that score poorly on that
@@ -771,7 +795,7 @@ def multi_embedding_search(
     results = []
     dim_scores_map = {}
 
-    for vid in intersected:
+    for vid in pooled:
         # Hard gate: skip venues that don't meet the cuisine threshold
         if cuisine_gate is not None and vid not in cuisine_gate:
             continue
@@ -862,6 +886,15 @@ HARD RULES — these OVERRIDE the bands above:
       venue that can't confirm the diet. Rank confirmed-diet venues first.
 - CUISINE IS THE SPINE. If the query names a cuisine and the candidate is a
   DIFFERENT cuisine, cap the score at 4 no matter how good the vibe or occasion.
+- FOOD FOCUS IS ALSO A SPINE. The "category / food focus" line may name a
+  dominant FOOD or PROTEIN style — meat-forward, seafood-led, vegetable-forward,
+  plant-based, BBQ/smokehouse, fried-chicken, and the like. When it does, treat
+  that focus exactly like cuisine: a candidate whose food does NOT centre that
+  focus caps at 4, no matter how perfectly it nails the format or occasion. A
+  fine-dining tasting menu that is not meat-focused is NOT a strong match for
+  "meat-centric tasting menu" — the food is the point, the format is secondary.
+  IGNORE format words that appear on this line (tasting menu, chef's table,
+  omakase, à la carte) — those are occasion, never the food focus.
 - A price ceiling is also pass/fail: if the profile clearly contradicts it, cap
   at 2; if silent, judge on the other dimensions.
 - Reviewer enthusiasm, famous chefs, or awards do NOT rescue a candidate whose
@@ -897,17 +930,24 @@ claim a match or mismatch on a dimension the user did not ask for. Do NOT mentio
 location.
 
 HARD-REQUIREMENT VERDICT — set "meets" and "caveat" for each candidate:
-- The HARD requirements are ONLY these, and ONLY when the parsed intent lists them:
-  dietary, price ceiling, meal service. (Cuisine is already enforced upstream.)
+- The HARD requirements are these, and ONLY when the parsed intent lists them:
+  dietary, price ceiling, meal service, AND a dominant food/category focus (the
+  "category / food focus" line, when it names a food/protein style — see the
+  FOOD FOCUS spine rule). Cuisine is already enforced upstream.
 - "meets": true  → the candidate satisfies EVERY hard requirement the user stated
-  (positive evidence for the diet, price not contradicted, serves the meal).
+  (positive evidence for the diet, price not contradicted, serves the meal, AND
+  its food genuinely centres the stated food focus).
 - "meets": false → it misses or cannot confirm at least one hard requirement,
   even though it may be an excellent match otherwise (a worthwhile alternative).
+  A venue that nails the format but misses the food focus (e.g. a non-meat
+  tasting menu for a "meat-centric" query) is meets=false, caveat "not
+  meat-focused".
 - If the parsed intent lists NO hard requirements (no dietary, no price ceiling,
-  no meal service), set "meets": true for every candidate — there is nothing to miss.
+  no meal service, no food focus), set "meets": true for every candidate —
+  there is nothing to miss.
 - "caveat": when meets=false, a ≤12-word phrase naming the ONE thing it doesn't
-  tick, phrased for a diner — e.g. "can't confirm vegan options", "likely above
-  your budget", "may not serve lunch". Empty string when meets=true.
+  tick, phrased for a diner — e.g. "can't confirm vegan options", "not
+  meat-focused", "likely above your budget", "may not serve lunch". Empty when meets=true.
 
 Return ONLY a valid JSON array, sorted by score descending, using the candidate
 id number you were given (NOT the name):
@@ -930,13 +970,26 @@ def _format_intent(query: str, constraints: dict | None, decomposed: dict | None
 
     intent: list[str] = []
     specified: list[str] = []
-    for key, label, short in [
-        ("cuisine_query",   "cuisine wanted", "cuisine"),
-        ("vibe_query",      "vibe wanted",    "vibe"),
-        ("occasion_query",  "occasion",       "occasion"),
-        ("key_facts_query", "key facts",      "key_facts"),
-        ("cost_query",      "cost / budget",  "cost"),
-    ]:
+    # Food-focus enforcement: pass tags_query so the re-ranker treats a
+    # meat/seafood/veg focus as a spine — but ONLY when the query names no
+    # cuisine. When a cuisine IS named (e.g. "intimate Persian"), the cuisine
+    # spine already covers the food axis and layering tags on top just demotes
+    # borderline venues (regressed the gold set in A/B). The food focus only
+    # needs a spine when it lives in tags because there's no cuisine word
+    # ("meat-centric tasting menu"). Gated by env for clean A/B eval.
+    _food_focus = os.environ.get("GUSTAVE_FOOD_FOCUS", "1") == "1"
+    _expose_tags = _food_focus and not (decomposed.get("cuisine_query") or "").strip()
+    _intent_keys = [
+        ("cuisine_query",   "cuisine wanted",       "cuisine"),
+        ("tags_query",      "category / food focus", "food_focus"),
+        ("vibe_query",      "vibe wanted",          "vibe"),
+        ("occasion_query",  "occasion",             "occasion"),
+        ("key_facts_query", "key facts",            "key_facts"),
+        ("cost_query",      "cost / budget",        "cost"),
+    ]
+    if not _expose_tags:
+        _intent_keys = [k for k in _intent_keys if k[0] != "tags_query"]
+    for key, label, short in _intent_keys:
         val = decomposed.get(key)
         if val:
             intent.append(f"  - {label}: {val}")
@@ -1177,7 +1230,7 @@ def search(query: str, top_k: int = DEFAULT_TOP_K, use_llm: bool = True,
 
     # Steps 3 + 4 — deeper pool when location filtering is on, so the restrict
     # step has venues across every zone to draw from.
-    cpool = LOCATION_POOL if loc_active else 50
+    cpool = LOCATION_POOL if loc_active else RETRIEVAL_POOL
     candidates, dim_scores_map = multi_embedding_search(
         decomposed, constraints, model, indexes, df, candidate_pool=cpool)
     debug["candidate_pool"] = [
@@ -1194,22 +1247,31 @@ def search(query: str, top_k: int = DEFAULT_TOP_K, use_llm: bool = True,
         reranked, rerank_debug = llm_rerank(query, candidates[:RERANK_POOL], df, constraints, decomposed)
         debug["reranker_scores"] = rerank_debug
         if reranked:
-            # Relevance floor: drop venues the re-ranker scored below RELEVANCE_MIN
-            # (wrong cuisine, one-token / peripheral matches). We show as many
-            # relevant venues as exist — never pad to a fixed count with weak ones.
-            relevant = [r for r in reranked if (r[1] if len(r) > 1 else 0) >= RELEVANCE_MIN]
-            debug["dropped_low_relevance"] = len(reranked) - len(relevant)
-            # Division: split on the re-ranker's hard-requirement verdict. Venues
-            # that satisfy every stated hard requirement are "matches"; the rest
-            # are surfaced afterwards as labelled alternatives (good fits that
-            # miss/can't-confirm a hard requirement). Both stay score-ordered.
-            matches = [r for r in relevant if len(r) >= 4 and r[3]]
-            alts    = [r for r in relevant if len(r) >= 4 and not r[3]]
-            final = matches[:top_k] + alts[:ALT_POOL]
+            def _score(r): return r[1] if len(r) > 1 else 0.0
+            def _meets(r): return bool(r[3]) if len(r) >= 4 else True
+            # Division with TWO floors:
+            #   ✅ matches      — score ≥ RELEVANCE_MIN AND satisfies every hard
+            #                     requirement (meets=True). The strong, on-the-nose fits.
+            #   💡 alternatives — anything else that still clears the lower
+            #                     ALT_RELEVANCE_MIN: a near-miss on score (4-6 band)
+            #                     OR a hard-requirement miss (meets=False, e.g. a
+            #                     non-meat tasting menu, a can't-confirm-vegan venue).
+            # This keeps the two-bucket division populated for queries where the
+            # close matches would otherwise be culled by the single 6.0 floor.
+            matches = [r for r in reranked if _score(r) >= RELEVANCE_MIN and _meets(r)]
+            alts    = [r for r in reranked
+                       if r not in matches and _score(r) >= ALT_RELEVANCE_MIN]
+            dropped = [r for r in reranked if _score(r) < ALT_RELEVANCE_MIN]
+            debug["dropped_low_relevance"] = len(dropped)
+            matches, alts = matches[:top_k], alts[:ALT_POOL]
+            final = matches + alts
+            n_matches = len(matches)
         else:
             final = candidates[:top_k]
+            n_matches = len(final)
     else:
         final = candidates[:top_k]
+        n_matches = len(final)
         debug["reranker_scores"] = []
 
     # Location mode: extend the base with an embedding-ranked tail so the restrict
@@ -1219,10 +1281,30 @@ def search(query: str, top_k: int = DEFAULT_TOP_K, use_llm: bool = True,
         tail = [(vid, sc) for vid, sc in candidates[:LOCATION_TAIL] if vid not in seen]
         final = final + tail
 
+    # Lazy-load "show more" tail: embedding-ranked candidates beyond the focused
+    # (re-ranked) set. No LLM cost — ordered by the combined embedding score and
+    # revealed on demand so the user can browse the full depth (100+ pizza places)
+    # without paying to re-rank them all. Skipped in location mode (own tail).
+    n_focused = len(final)
+    if not loc_active:
+        shown = {f[0] for f in final}
+        more = [(vid, sc) for vid, sc in candidates if vid not in shown][:MORE_POOL]
+        final = final + more
+
     # Step 6
     results = format_results(final, df)
-    debug["match_count"] = sum(1 for r in results if r.get("meets"))
-    debug["alt_count"]   = sum(1 for r in results if not r.get("meets"))
+    # Tag each result's bucket explicitly. final = matches | alternatives | more.
+    #   matches      : index < n_matches           (is_alt=False, is_more=False)
+    #   alternatives : n_matches ≤ index < n_focused (is_alt=True)
+    #   more (lazy)  : index ≥ n_focused            (is_more=True) — browse tail
+    # The apps bucket on is_alt/is_more (not on `meets`) so a score-band near-miss
+    # that still satisfies its hard requirements lands under alternatives.
+    for i, r in enumerate(results):
+        r["is_alt"]  = n_matches <= i < n_focused
+        r["is_more"] = i >= n_focused
+    debug["match_count"] = sum(1 for r in results if not r.get("is_alt") and not r.get("is_more"))
+    debug["alt_count"]   = sum(1 for r in results if r.get("is_alt"))
+    debug["more_count"]  = sum(1 for r in results if r.get("is_more"))
     debug["final_count"] = len(results)
     debug["cached"] = False
 
