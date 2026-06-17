@@ -25,7 +25,7 @@ cp "$src/learn_core.py" "$here/learn_core.py"
 cp "$src/geo_zones.py"  "$here/geo_zones.py"   # pipeline imports it (location-aware, off by default)
 mkdir -p "$here/eval"
 cp "$src/eval/expansions.json" "$here/eval/expansions.json"
-for f in faiss_vibe faiss_cuisine faiss_occasion faiss_key_facts faiss_full; do
+for f in faiss_vibe faiss_cuisine faiss_occasion faiss_key_facts faiss_tags faiss_full; do
   cp "$src/cache/$f.index" "$here/engine/data/$f.index"
 done
 cp "$src/cache/venues_v2.pkl" "$here/engine/data/venues_v2.pkl"

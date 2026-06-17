@@ -131,7 +131,7 @@ def _load_resources():
         _model = SentenceTransformer(MODEL_NAME)
 
     if not _indexes:
-        for dim in ["vibe", "cuisine", "occasion", "key_facts", "full"]:
+        for dim in ["vibe", "cuisine", "occasion", "key_facts", "tags", "full"]:
             path = CACHE_DIR / f"faiss_{dim}.index"
             if path.exists():
                 _indexes[dim] = faiss.read_index(str(path))
@@ -493,15 +493,22 @@ HARD CONSTRAINTS — binary; only set when EXPLICITLY present, never infer:
 SEMANTIC DIMENSIONS — short strings (2-5 words) or null:
   vibe_query:      mood/atmosphere/setting (romantic, lively, cosy) — NO cost words
   cuisine_query:   food type or dishes (Italian, sushi, pizza)
-  occasion_query:  occasion/group (date night, birthday, business) — NO cost words
+  occasion_query:  occasion/group AND dining FORMAT — date night, birthday, business, tasting menu,
+                   chef's table, omakase, à la carte, set menu, counter dining, small plates. NO cost words
   location_query:  neighbourhood/area/landmark (Soho, Shoreditch)
   key_facts_query: proper nouns — chef/owner names, sister/parent venues, awards (Michelin), TV credits
   cost_query:      ANY price stipulation (cheap, splurge, "under £50pp") — cost words go ONLY here
+  tags_query:      CATEGORY descriptors of the place wanted, at the abstraction level a diner uses —
+                   protein/diet focus (meat-forward, seafood-led, vegetable-forward, vegan-friendly),
+                   the cuisine if named, and style (casual, fine-dining, barbecue, small-plates).
+                   e.g. "meat lovers" → "meat-forward"; "lots of seafood" → "seafood-led";
+                   "casual italian" → "italian casual". null if purely a specific dish/proper-noun.
 
 Rules:
 - price_max ONLY on explicit price language: "cheap/budget/inexpensive"→budget; "not too expensive/mid-range/reasonable"→££; "splurge/expensive/fine dining/blowout/treat ourselves"→£££. "special/nice/lovely/intimate/for a date/romantic" do NOT imply price → leave null.
 - meal_service: "dinner/supper/evening meal"→dinner; "lunch/midday"→lunch; "breakfast/morning"→breakfast; "brunch"→brunch; "drinks/cocktails/bar"→drinks.
 - Dietary words go ONLY in `dietary` — never in cuisine_query.
+- Dining FORMAT words (tasting menu, chef's table, omakase, set menu, à la carte, counter dining, small plates) go ONLY in occasion_query — NEVER in cuisine_query or tags_query. So "meat tasting menu" → tags_query "meat-forward", occasion_query "tasting menu" (not "meat tasting menu").
 - Never leak cost language into vibe_query or occasion_query — it belongs in cost_query (and price_max if a tier).
 - Anything not clearly present → null (or [] for dietary).
 - Return ONLY valid JSON. No explanation."""
@@ -510,6 +517,7 @@ _CONSTRAINT_KEYS = {"dietary": [], "price_max": None, "open_on": None, "meal_ser
 _DECOMPOSE_KEYS = {
     "vibe_query": None, "cuisine_query": None, "occasion_query": None,
     "location_query": None, "key_facts_query": None, "cost_query": None,
+    "tags_query": None,
 }
 
 
@@ -702,6 +710,7 @@ def multi_embedding_search(
         "cuisine_query":   "cuisine",
         "occasion_query":  "occasion",
         "key_facts_query": "key_facts",
+        "tags_query":      "tags",
     }
 
     active = [
@@ -711,7 +720,7 @@ def multi_embedding_search(
     ]
 
     # Always search full-profile as catch-all (exclude location_query — not used in scoring)
-    _scoring_keys = {"vibe_query", "cuisine_query", "occasion_query", "key_facts_query"}
+    _scoring_keys = {"vibe_query", "cuisine_query", "occasion_query", "key_facts_query", "tags_query"}
     full_query = " ".join(v for k, v in decomposed.items() if k in _scoring_keys and v) or ""
     # Fold any hard dietary requirement into the full-profile query so the
     # candidate pool surfaces dietary-appropriate venues, not just format matches.
