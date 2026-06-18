@@ -211,13 +211,39 @@ def _g(v: dict, *keys):
     return None
 
 
+# Editorial publications a venue is featured in, normalised from the raw
+# review-source string, each with a brand logo (Clearbit, with a text fallback).
+_MAGS = {
+    "infatuation": ("The Infatuation", "theinfatuation.com"),
+    "the infatuation": ("The Infatuation", "theinfatuation.com"),
+    "hot dinners": ("Hot Dinners", "hot-dinners.com"),
+    "michelin": ("Michelin", "guide.michelin.com"),
+    "timeout": ("Time Out", "timeout.com"),
+    "timeout london": ("Time Out", "timeout.com"),
+    "time out": ("Time Out", "timeout.com"),
+    "cn traveler": ("Condé Nast Traveller", "cntraveller.com"),
+    "cn traveller": ("Condé Nast Traveller", "cntraveller.com"),
+    "condé nast traveller": ("Condé Nast Traveller", "cntraveller.com"),
+    "conde nast traveller": ("Condé Nast Traveller", "cntraveller.com"),
+}
+
+
+def _magazines(src: str) -> list[tuple[str, str]]:
+    """Normalise the raw 'Appears on' string into [(name, logo_domain)], deduped."""
+    out: dict[str, str] = {}
+    for part in str(src or "").split(","):
+        hit = _MAGS.get(part.strip().lower())
+        if hit:
+            out[hit[0]] = hit[1]
+    return list(out.items())
+
+
 def _render_card(v: dict, is_alt: bool = False) -> None:
     """Render one venue card — used by search results and map-click popups.
     is_alt=True leads with the caveat (why it's an alternative, not a full match)."""
     st.subheader(str(_g(v, "name", "Restaurant") or "—").strip("'\""))
     addr = _g(v, "address", "Area", "Address") or "London"
-    src = _g(v, "source", "Appears on") or ""
-    st.caption(f"📍 {addr}" + (f"   ·   {src}" if src else ""))
+    st.caption(f"📍 {addr}")
     rt = _num(_g(v, "rating", "Rating"))
     if rt:
         rc = _num(_g(v, "rating_count", "Rating_count"))
@@ -227,8 +253,20 @@ def _render_card(v: dict, is_alt: bool = False) -> None:
         st.warning(f"⚠️ **Doesn't tick:** {v['caveat']}")
     if v.get("llm_reason"):
         st.markdown(f"💡 *{v['llm_reason']}*")
-    if v.get("review_snippet"):
-        st.markdown(f"> {v['review_snippet']}")
+    # Featured-in: editorial publications, shown with brand logos.
+    mags = _magazines(_g(v, "source", "Appears on"))
+    if mags:
+        chips = "".join(
+            f'<span style="display:inline-flex;align-items:center;gap:4px;'
+            f'margin:0 12px 4px 0;white-space:nowrap;">'
+            f'<img src="https://logo.clearbit.com/{dom}" height="15" '
+            f'style="vertical-align:middle;border-radius:3px;" '
+            f'onerror="this.style.display=\'none\'"/>'
+            f'<span style="font-size:0.82em;color:#666;">{name}</span></span>'
+            for name, dom in mags)
+        st.markdown(
+            f'<div style="margin:6px 0;"><span style="font-size:0.82em;color:#888;">'
+            f'Featured in </span>{chips}</div>', unsafe_allow_html=True)
     links = []
     for label, keys in (("Book a table", ("reservation", "Reservation")),
                         ("Menu", ("menu", "Menu")),
@@ -458,18 +496,21 @@ if results:
 
 # ── Feedback: report a miss / suggest a fix → feeds the learning loop ────────
 st.divider()
-with st.expander("💬 Spotted a miss? Help improve Gustave", expanded=False):
-    st.caption("If a search missed a place it should have shown, tell us — it goes "
-               "straight into Gustave's learning loop.")
+with st.expander("💬 Spotted a problem? Help improve Gustave", expanded=False):
+    st.caption("A place missing, a broken link, wrong info — anything off. "
+               "It goes straight into Gustave's learning loop.")
     with st.form("feedback_form", clear_on_submit=True):
         fb_q = st.text_input("The search you ran", value=st.session_state.get("_query", ""))
-        fb_v = st.text_input("Place(s) that should have appeared (comma-separated)")
-        fb_n = st.text_area("Anything else? (optional)", height=70)
+        fb_type = st.selectbox("What's the issue?", [
+            "A place is missing", "A link is broken or wrong",
+            "Wrong info on a venue", "Something else"])
+        fb_v = st.text_input("Venue(s) involved (comma-separated) — optional")
+        fb_n = st.text_area("What went wrong?", height=70)
         sent = st.form_submit_button("Send feedback")
     if sent:
         venues = [v.strip() for v in fb_v.split(",") if v.strip()]
-        if not (fb_q.strip() and venues):
-            st.warning("Add the search and at least one place that should have appeared.")
+        if not (fb_q.strip() or fb_n.strip() or venues):
+            st.warning("Add the search, a venue, or a note so we know what to look at.")
         else:
             try:
                 import learn_core, cloud_log
@@ -477,8 +518,9 @@ with st.expander("💬 Spotted a miss? Help improve Gustave", expanded=False):
                 entry = {
                     "id": datetime.now().strftime("%Y-%m-%d-%H%M%S"),
                     "date": datetime.now().strftime("%Y-%m-%d"),
-                    "query": fb_q.strip(), "should_surface": venues,
-                    "note": fb_n.strip(), "source": "live", "status": "pending", "triage": None}
+                    "query": fb_q.strip(), "kind": fb_type,
+                    "should_surface": venues, "note": fb_n.strip(),
+                    "source": "live", "status": "pending", "triage": None}
                 learn_core.append_learning(entry)          # local (ephemeral on cloud)
                 cloud_log.append("learnings.jsonl", entry)  # durable mirror to gist
                 st.success("Thanks — logged! Andrei will take a look.")
