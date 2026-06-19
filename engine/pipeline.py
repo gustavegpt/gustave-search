@@ -653,6 +653,15 @@ def _meal_service_score(review: str, requested: str) -> float:
     if opposite_hits >= 2 and opposite_hits > wanted_hits * 2:
         return 0.1   # e.g. 3 breakfast hits, 1 dinner hit → breakfast venue
 
+    # Brunch and breakfast are SPECIFIC meals a venue must positively demonstrate.
+    # A venue silent on both (no eggs/pastries/brunch/coffee signals) almost
+    # certainly isn't a brunch spot — here silence is disqualifying, not neutral.
+    # Without this, a fully-vegan Indian dinner spot scores 1.0 on "vegan brunch"
+    # purely on the diet match and crowds out real brunch venues. (Dinner and
+    # lunch are near-universal, so their absence stays neutral below.)
+    if requested in ("brunch", "breakfast") and wanted_hits == 0:
+        return 0.4
+
     if opposite_hits > wanted_hits:
         return 0.4   # e.g. 2 breakfast hits, 1 dinner hit → lean mismatch
 
